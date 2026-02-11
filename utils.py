@@ -45,7 +45,7 @@ def kl_divergence(mu, logvar):
     return total_kld
 
 
-def loss_function(recon_x, x, mu, logvar, kl_weight=0.1):
+def loss_function(recon_x, x, mu, logvar):
     batch_size = mu.size(0)
     assert batch_size != 0
     
@@ -59,7 +59,7 @@ def loss_function(recon_x, x, mu, logvar, kl_weight=0.1):
 
     # KL divergence
     total_kld = kl_divergence(mu, logvar)   # shape [1]
-    kl_loss = total_kld[0] * kl_weight
+    kl_loss = total_kld[0]
     
     return recon_loss, kl_loss
 
