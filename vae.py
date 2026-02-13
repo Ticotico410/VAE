@@ -1,86 +1,165 @@
 import torch
-from torch import nn
-from torch.nn import functional as F
+from torch import nn, optim
+import torch.nn.functional as F
 
 
-class VAE(nn.Module):
-    def __init__(self, zsize, layer_count=3, channels=3):
-        super(VAE, self).__init__()
+def gn(channels: int) -> nn.GroupNorm:
+    return nn.GroupNorm(num_groups=min(32, channels), num_channels=channels)
 
-        d = 128
-        self.d = d
-        self.zsize = zsize
+class ResizeConv2d(nn.Module):
 
-        self.layer_count = layer_count
-
-        mul = 1
-        inputs = channels
-        for i in range(self.layer_count):
-            setattr(self, "conv%d" % (i + 1), nn.Conv2d(inputs, d * mul, 4, 2, 1))
-            setattr(self, "conv%d_bn" % (i + 1), nn.BatchNorm2d(d * mul))
-            inputs = d * mul
-            mul *= 2
-
-        self.d_max = inputs
-
-        self.fc1 = nn.Linear(inputs * 4 * 4, zsize)
-        self.fc2 = nn.Linear(inputs * 4 * 4, zsize)
-
-        self.d1 = nn.Linear(zsize, inputs * 4 * 4)
-
-        mul = inputs // d // 2
-
-        for i in range(1, self.layer_count):
-            setattr(self, "deconv%d" % (i + 1), nn.ConvTranspose2d(inputs, d * mul, 4, 2, 1))
-            setattr(self, "deconv%d_bn" % (i + 1), nn.BatchNorm2d(d * mul))
-            inputs = d * mul
-            mul //= 2
-
-        setattr(self, "deconv%d" % (self.layer_count + 1), nn.ConvTranspose2d(inputs, channels, 4, 2, 1))
-
-    def encode(self, x):
-        for i in range(self.layer_count):
-            x = F.relu(getattr(self, "conv%d_bn" % (i + 1))(getattr(self, "conv%d" % (i + 1))(x)))
-
-        x = x.view(x.shape[0], self.d_max * 4 * 4)
-        h1 = self.fc1(x)
-        h2 = self.fc2(x)
-        return h1, h2
-
-    def reparameterize(self, mu, logvar):
-        if self.training:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            return eps.mul(std).add_(mu)
-        else:
-            return mu
-
-    def decode(self, x):
-        x = x.view(x.shape[0], self.zsize)
-        x = self.d1(x)
-        x = x.view(x.shape[0], self.d_max, 4, 4)
-        #x = self.deconv1_bn(x)
-        x = F.leaky_relu(x, 0.2)
-
-        for i in range(1, self.layer_count):
-            x = F.leaky_relu(getattr(self, "deconv%d_bn" % (i + 1))(getattr(self, "deconv%d" % (i + 1))(x)), 0.2)
-
-        x = F.tanh(getattr(self, "deconv%d" % (self.layer_count + 1))(x))
-        return x
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor, mode='nearest'):
+        super().__init__()
+        self.scale_factor = scale_factor
+        self.mode = mode
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=1, padding=1)
 
     def forward(self, x):
-        mu, logvar = self.encode(x)
-        mu = mu.squeeze()
-        logvar = logvar.squeeze()
-        z = self.reparameterize(mu, logvar)
-        return self.decode(z.view(-1, self.zsize, 1, 1)), mu, logvar
+        x = F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
+        x = self.conv(x)
+        return x
 
-    def weight_init(self, mean, std):
-        for m in self._modules:
-            normal_init(self._modules[m], mean, std)
+class BasicBlockEnc(nn.Module):
 
+    def __init__(self, in_planes, stride=1):
+        super().__init__()
 
-def normal_init(m, mean, std):
-    if isinstance(m, nn.ConvTranspose2d) or isinstance(m, nn.Conv2d):
-        m.weight.data.normal_(mean, std)
-        m.bias.data.zero_()
+        planes = in_planes*stride
+
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = gn(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = gn(planes)
+
+        if stride == 1:
+            self.shortcut = nn.Sequential()
+        else:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=False),
+                gn(planes)
+            )
+
+    def forward(self, x):
+        out = torch.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = torch.relu(out)
+        return out
+
+class BasicBlockDec(nn.Module):
+
+    def __init__(self, in_planes, stride=1):
+        super().__init__()
+
+        planes = int(in_planes/stride)
+
+        self.conv2 = nn.Conv2d(in_planes, in_planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = gn(in_planes)
+        # self.bn1 could have been placed here, but that messes up the order of the layers when printing the class
+
+        if stride == 1:
+            self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+            self.bn1 = gn(planes)
+            self.shortcut = nn.Sequential()
+        else:
+            self.conv1 = ResizeConv2d(in_planes, planes, kernel_size=3, scale_factor=stride)
+            self.bn1 = gn(planes)
+            self.shortcut = nn.Sequential(
+                ResizeConv2d(in_planes, planes, kernel_size=3, scale_factor=stride),
+                gn(planes)
+            )
+
+    def forward(self, x):
+        out = torch.relu(self.bn2(self.conv2(x)))
+        out = self.bn1(self.conv1(out))
+        out += self.shortcut(x)
+        out = torch.relu(out)
+        return out
+
+class ResNet18Enc(nn.Module):
+
+    def __init__(self, num_Blocks=[2,2,2,2], z_dim=10, nc=3):
+        super().__init__()
+        self.in_planes = 64
+        self.z_dim = z_dim
+        self.conv1 = nn.Conv2d(nc, 64, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1 = gn(64)
+        self.layer1 = self._make_layer(BasicBlockEnc, 64, num_Blocks[0], stride=1)
+        self.layer2 = self._make_layer(BasicBlockEnc, 128, num_Blocks[1], stride=2)
+        self.layer3 = self._make_layer(BasicBlockEnc, 256, num_Blocks[2], stride=2)
+        # self.layer4 = self._make_layer(BasicBlockEnc, 512, num_Blocks[3], stride=2)
+        self.linear = nn.Linear(256, 2 * z_dim)
+
+    def _make_layer(self, BasicBlockEnc, planes, num_Blocks, stride):
+        strides = [stride] + [1]*(num_Blocks-1)
+        layers = []
+        for stride in strides:
+            layers += [BasicBlockEnc(self.in_planes, stride)]
+            self.in_planes = planes
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = torch.relu(self.bn1(self.conv1(x)))
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        #x = self.layer4(x)
+        x = F.adaptive_avg_pool2d(x, 1)
+        x = x.view(x.size(0), -1)
+        x = self.linear(x)
+        mu = x[:, :self.z_dim]
+        logvar = x[:, self.z_dim:]
+        return mu, logvar
+
+class ResNet18Dec(nn.Module):
+
+    def __init__(self, num_Blocks=[2,2,2,2], z_dim=10, nc=3):
+        super().__init__()
+        self.in_planes = 256
+
+        self.linear = nn.Linear(z_dim, 256)
+
+        self.layer4 = self._make_layer(BasicBlockDec, 128, num_Blocks[3], stride=2)
+        self.layer3 = self._make_layer(BasicBlockDec, 64, num_Blocks[2], stride=2)
+        self.layer2 = self._make_layer(BasicBlockDec, 32, num_Blocks[1], stride=2)
+        self.layer1 = self._make_layer(BasicBlockDec, 32, num_Blocks[0], stride=1)
+        self.conv1 = ResizeConv2d(32, nc, kernel_size=3, scale_factor=2)
+
+    def _make_layer(self, BasicBlockDec, planes, num_Blocks, stride):
+        strides = [stride] + [1]*(num_Blocks-1)
+        layers = []
+        for stride in reversed(strides):
+            layers += [BasicBlockDec(self.in_planes, stride)]
+        self.in_planes = planes
+        return nn.Sequential(*layers)
+
+    def forward(self, z):
+        x = self.linear(z)
+        x = x.view(z.size(0), 256, 1, 1)
+        x = F.interpolate(x, scale_factor=4)
+        x = self.layer4(x)
+        x = self.layer3(x)
+        x = self.layer2(x)
+        x = self.layer1(x)
+        x = torch.sigmoid(self.conv1(x))
+        x = x.view(x.size(0), 3, 64, 64)
+        return x
+
+class VAE(nn.Module):
+
+    def __init__(self, z_dim):
+        super().__init__()
+        self.encoder = ResNet18Enc(z_dim=z_dim)
+        self.decoder = ResNet18Dec(z_dim=z_dim)
+
+    def forward(self, x):
+        mean, logvar = self.encoder(x)
+        z = self.reparameterize(mean, logvar)
+        x = self.decoder(z)
+        return x, z
+    
+    @staticmethod
+    def reparameterize(mean, logvar):
+        std = torch.exp(logvar / 2) # in log-space, squareroot is divide by two
+        epsilon = torch.randn_like(std)
+        return epsilon * std + mean

@@ -1,315 +1,303 @@
 from __future__ import print_function
 
 import os
-import time
-import pickle
-import random
 import copy
-import argparse
+import math
 import shutil
-import numpy as np
-import scipy.linalg
+import argparse
 
-
-import torch.utils.data
+import torch
+import torch.nn.functional as F
 from torch import optim
+from torch.utils.data import DataLoader
 from torchvision.utils import save_image
-import torchvision.transforms as transforms
 
 from vae import *
 from tqdm import tqdm
-from PIL import Image
-from dataloader import get_dataloader
 from ignite.metrics import FID, InceptionScore
-from utils import interpolate, loss_function, plot_loss_curves
+
+from utils import loss_function, viz_loss
+from dataloader import get_dataloader, VAEDataset
 
 
-im_size = 128
+im_size = 64
 
-def train_vae(config):
-    batch_size = config['batch_size']
-    z_size = config['z_size']
+def train_vae(config, train_loader):
     lr = config['lr']
-    train_epoch = config['num_epochs']
-    ckpt_dir = config['ckpt_dir']
-    data_dir = config['data_dir']
-    layer_count = config['layer_count']
+    z_size = config['z_size']
     kl_weight = config['kl_weight']
+    rec_weight = config['rec_weight']
+    train_epoch = config['num_epochs']
+    save_per_epoch = config['save_per_epoch']
 
-    vae = VAE(zsize=z_size, layer_count=layer_count)
-    vae.cuda()
-    vae.train()
-    vae.weight_init(mean=0.0, std=0.02)
+    ckpt_dir = config['ckpt_dir']
+    os.makedirs(ckpt_dir, exist_ok=True)
 
-    optimizer = optim.Adam(vae.parameters(), lr=lr, betas=(0.5, 0.999), weight_decay=1e-5)
-    
-    checkpoint_dir = ckpt_dir
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
+    # VAE model setup
+    model = VAE(z_dim=z_size).cuda()
+    optimizer = optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=0)
+
     min_loss = float('inf')
     best_epoch = 0
     best_model_state = None
-    
+    best_optimizer_state = None
+
     epoch_rec_losses = []
     epoch_kl_losses = []
     epoch_total_losses = []
 
-    print("Loading data...")
-    train_loader = get_dataloader(
-        data_dir, 
-        batch_size=batch_size, 
-        im_size=im_size, 
-        shuffle=True, 
-        num_workers=1,
-        pin_memory=True
-    )
+    # Load data
+    print("Loading training dataset...")
     print("Train set size:", len(train_loader.dataset))
-    num_batches_per_epoch = len(train_loader)
-    
+
     for epoch in range(train_epoch):
         print(f"\nEpoch {epoch+1}/{train_epoch}")
-        vae.train()
+        model.train()
 
-        # if (epoch + 1) % 8 == 0:
-        #     optimizer.param_groups[0]['lr'] /= 4
-        #     print(f"Epoch {epoch+1}: Learning rate changed to {optimizer.param_groups[0]['lr']:.6f}")
+        rec_loss = 0.0
+        kl_loss = 0.0
+        total_loss = 0.0
+        loss_rec_weighted_sum = 0.0
+        loss_kl_weighted_sum = 0.0
 
-        rec_loss = 0
-        kl_loss = 0
-        total_loss = 0
-
-        epoch_start_time = time.time()
+        z_mean_sum = 0.0
+        z_std_sum = 0.0
+        mu_std_sum = 0.0
+        sigma_mean_sum = 0.0
+        active_units_sum = 0.0
 
         batch_pbar = tqdm(
             train_loader,
-            total=num_batches_per_epoch,
             unit="batch",
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {rate_fmt}",
         )
 
-        batch_count = 0
         for x in batch_pbar:
-            batch_count += 1
-            x = x.cuda()  # Move batch to GPU
+            x = x.cuda(non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            rec, mu, logvar = vae(x)
 
-            loss_rec, loss_kl = loss_function(rec, x, mu, logvar, kl_weight)
-            loss = loss_rec + loss_kl
+            mu, logvar = model.encoder(x)
+            z = model.reparameterize(mu, logvar)
+            rec = model.decoder(z)
+
+            loss_rec, loss_kl = loss_function(rec, x, mu, logvar, use_free_bits=True, free_bits=0.01)
+            loss_rec_weighted = loss_rec * rec_weight
+            loss_kl_weighted = loss_kl * kl_weight
+            loss = loss_rec_weighted + loss_kl_weighted
             loss.backward()
             optimizer.step()
-            
+
             rec_loss += loss_rec.item()
             kl_loss += loss_kl.item()
             total_loss += loss.item()
+            loss_rec_weighted_sum += loss_rec_weighted.item()
+            loss_kl_weighted_sum += loss_kl_weighted.item()
 
-            del rec, mu, logvar, loss_rec, loss_kl, loss
+            # Debugging
+            z_mean_sum += z.mean().item()
+            z_std_sum += z.std().item()
+
+            mu_std_sum += mu.std().item()
+            sigma = torch.exp(0.5 * logvar)
+            sigma_mean_sum += sigma.mean().item()
+            mu_var_dim = mu.var(dim=0, unbiased=False)
+            active_units = (mu_var_dim > 1e-3).float().sum().item()
+            active_units_sum += active_units
         
-        # Calculate epoch statistics
-        avg_rec_loss = rec_loss / batch_count if batch_count > 0 else 0
-        avg_kl_loss = kl_loss / batch_count if batch_count > 0 else 0
-        avg_total_loss = total_loss / batch_count if batch_count > 0 else 0
-        
+        # metrics
+        batch_count = len(train_loader)
+        avg_rec_loss = rec_loss / batch_count
+        avg_kl_loss = kl_loss / batch_count
+        avg_total_loss = total_loss / batch_count
+        avg_rec_weighted_loss = loss_rec_weighted_sum / batch_count
+        avg_kl_weighted_loss = loss_kl_weighted_sum / batch_count
+
+        avg_z_mean = z_mean_sum / batch_count
+        avg_z_std = z_std_sum / batch_count
+        avg_mu_std = mu_std_sum / batch_count
+        avg_sigma_mean = sigma_mean_sum / batch_count
+        avg_active_units = active_units_sum / batch_count
+
         print(f"Train loss: {avg_total_loss:.5f}")
-        print(f"rec_loss: {avg_rec_loss:.3f} kl_loss: {avg_kl_loss:.3f} loss: {avg_total_loss:.3f}")
+        print(f"[Origin] rec_loss: {avg_rec_loss:.5f} kl_loss: {avg_kl_loss:.5f}")
+        print(f"[Weight] rec_loss: {avg_rec_weighted_loss:.5f} kl_loss: {avg_kl_weighted_loss:.5f}")
+        print(f"[Latent] z_mean={avg_z_mean:.4f}, z_std={avg_z_std:.4f}")
+        print(f"[Latent] mu_std={avg_mu_std:.4f}, sigma_mean={avg_sigma_mean:.4f}, active_units={avg_active_units:.1f}")
 
         if avg_total_loss < min_loss:
             min_loss = avg_total_loss
             best_epoch = epoch + 1
-            best_model_state = copy.deepcopy(vae.state_dict())
-        
+            best_model_state = copy.deepcopy(model.state_dict())
+            best_optimizer_state = copy.deepcopy(optimizer.state_dict())
+
         epoch_rec_losses.append(avg_rec_loss)
         epoch_kl_losses.append(avg_kl_loss)
         epoch_total_losses.append(avg_total_loss)
-        
-        # Save checkpoint every 5 epochs
-        if (epoch + 1) % 100 == 0:
-            checkpoint = {
-                'epoch': epoch + 1,
-                'model_state_dict': vae.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'avg_rec_loss': avg_rec_loss,
-                'avg_kl_loss': avg_kl_loss,
-                'avg_total_loss': avg_total_loss,
-                'z_size': z_size,
-                'layer_count': layer_count,
-            }
-            checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth')
-            torch.save(checkpoint, checkpoint_path)
-    
-    plot_loss_curves(
-        epoch_rec_losses,
-        epoch_kl_losses,
-        epoch_total_losses,
-        train_epoch,
-        ckpt_dir,
-    )
-    
+
+        # Save checkpoints in a specified interval
+        # if (epoch + 1) % save_per_epoch == 0:
+        #     checkpoint = {
+        #         'epoch': epoch + 1,
+        #         'model_state_dict': model.state_dict(),
+        #         'optimizer_state_dict': optimizer.state_dict(),
+        #         'avg_rec_loss': avg_rec_loss,
+        #         'avg_kl_loss': avg_kl_loss,
+        #         'avg_total_loss': avg_total_loss,
+        #         'z_size': z_size,
+        #     }
+        #     checkpoint_path = os.path.join(ckpt_dir, f'checkpoint_epoch_{epoch+1}.pth')
+        #     torch.save(checkpoint, checkpoint_path)
+
+    viz_loss(epoch_rec_losses, epoch_kl_losses, train_epoch, ckpt_dir)
+
     # save the best model
     if best_model_state is not None:
+        if best_optimizer_state is None:
+            best_optimizer_state = optimizer.state_dict()
+
         best_checkpoint = {
             'epoch': best_epoch,
             'model_state_dict': best_model_state,
-            'optimizer_state_dict': optimizer.state_dict(),
+            'optimizer_state_dict': best_optimizer_state,
             'min_loss': min_loss,
             'z_size': z_size,
-            'layer_count': layer_count,
         }
-        # Save best epoch checkpoint
-        best_checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{best_epoch}.pth')
+        best_checkpoint_path = os.path.join(ckpt_dir, f'checkpoint_epoch_{best_epoch}.pth')
         torch.save(best_checkpoint, best_checkpoint_path)
-        best_copy_path = os.path.join(checkpoint_dir, 'best.pth')
+        best_copy_path = os.path.join(ckpt_dir, 'best.pth')
         shutil.copy2(best_checkpoint_path, best_copy_path)
         print(f"Best checkpoint saved: {best_copy_path} (Epoch {best_epoch}, Loss: {min_loss:.6f})")
-    
+
     return best_epoch, min_loss, best_model_state
 
-def eval_vae(config):
-    ckpt_dir = config['ckpt_dir']
+
+def eval_vae(config, test_loader):
     batch_size = config['batch_size']
-    data_dir = config['data_dir']
-    
-    # Load checkpoint - support both best.pth and epoch checkpoints
+    ckpt_dir = config['ckpt_dir']
+
+    # Load checkpoint
     ckpt_name = config.get('ckpt_name', 'best.pth')
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}.")
-    
     checkpoint = torch.load(ckpt_path, map_location='cuda')
     print(f"Loaded checkpoint: {ckpt_path}")
     print(f"  Epoch: {checkpoint.get('epoch', 'unknown')}")
-    
-    # Handle different checkpoint formats
-    # best.pth has 'min_loss', epoch checkpoints have 'avg_total_loss'
+
     loss_value = checkpoint.get('min_loss') or checkpoint.get('avg_total_loss')
     if loss_value is not None:
         print(f"  Loss: {loss_value:.4f}")
-    
+
     # Create model with same configuration
     z_size = checkpoint.get('z_size', 512)
-    layer_count = checkpoint.get('layer_count', 5)
-    vae = VAE(zsize=z_size, layer_count=layer_count)
-    vae.load_state_dict(checkpoint['model_state_dict'])
-    vae.cuda()
-    vae.eval()
-    print(f"Model loaded: z_size={z_size}, layer_count={layer_count}")
-    
+    model = VAE(z_dim=z_size).cuda()
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    print(f"Model loaded: z_size={z_size}")
+
     # Initialize Ignite metrics for FID and IS
     print("Initializing FID and Inception Score metrics...")
     fid_metric = FID(device='cuda')
-    is_metric = InceptionScore(device='cuda', output_transform=lambda x: x[0])
-    
+    is_metric = InceptionScore(device='cuda')
+
     # Load data
-    print("Loading data...")
-    eval_loader = get_dataloader(
-        data_dir,
-        batch_size=batch_size,
-        im_size=im_size,
-        shuffle=False,
-        num_workers=1,
-        pin_memory=True
-    )
-    print("Eval set size:", len(eval_loader.dataset))
-    
-    # Create output directories
+    print("Loading testing dataset...")
+    print("Test set size:", len(test_loader.dataset))
+
     os.makedirs('results_rec', exist_ok=True)
     os.makedirs('results_gen', exist_ok=True)
-    
-    # Limit evaluation to first 500 samples (or fewer if dataset is smaller)
-    num_eval_batches = min(500 // batch_size, len(eval_loader))
-    
-    print(f"\nEvaluating with {num_eval_batches * batch_size} samples (max)...")
-    
-    # Collect samples for visualization
-    sample_real_list = []
-    sample_recon_list = []
-    sample_gen_list = []
-    
+
+    # Evaluate all samples
+    max_eval_samples = len(test_loader.dataset)
+    num_eval_batches = math.ceil(max_eval_samples / batch_size)
+    print(f"\nEvaluating with {max_eval_samples} samples ...")
+
+    # Preprocess: GPU batch resize to 299 + ImageNet normalize
+    mean = torch.tensor([0.485, 0.456, 0.406], device='cuda').view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device='cuda').view(1, 3, 1, 1)
+
+    def to_inception_input(x01: torch.Tensor) -> torch.Tensor:  
+        x = F.interpolate(x01, size=(299, 299), mode='bilinear', align_corners=False)
+        x = x.clamp(0.0, 1.0)
+        x = (x - mean) / std
+        return x
+
+    sample_real_list, sample_recon_list, sample_gen_list = [], [], []
+
     with torch.no_grad():
-        eval_pbar = tqdm(eval_loader, desc="Evaluating", unit="batch", total=num_eval_batches)
+        eval_pbar = tqdm(test_loader, desc="Evaluating", unit="batch")
+        seen = 0
+
         for batch_idx, eval_x in enumerate(eval_pbar):
-            if batch_idx >= num_eval_batches:
-                break
-            eval_x = eval_x.cuda()  # Move batch to GPU
-            # Reconstruction: encode and decode
-            x_rec, _, _ = vae(eval_x)
-            if batch_idx == 0:  # Save first batch for visualization
+            eval_x = eval_x.cuda(non_blocking=True)  # [0,1]
+
+            # Reconstruction
+            mu, logvar = model.encoder(eval_x)
+            # z = model.reparameterize(mu, logvar)
+            z = mu
+            x_rec = model.decoder(z)  # [0,1]
+
+            # Generation
+            z_fake = torch.randn(eval_x.size(0), z_size, device='cuda')
+            fake_imgs = model.decoder(z_fake)  # [0,1]
+
+            # Save first batch for visualization
+            if batch_idx == 0:
                 sample_real_list.append(eval_x[:8].cpu())
                 sample_recon_list.append(x_rec[:8].cpu())
-            
-            # Generate fake images from random latent vectors
-            z_fake = torch.randn(eval_x.size(0), z_size, device='cuda').view(-1, z_size, 1, 1)
-            fake_imgs = vae.decode(z_fake)
-            
-            if batch_idx == 0:  # Save first batch for visualization
                 sample_gen_list.append(fake_imgs[:8].cpu())
-            
-            # Interpolate to 299x299 for Inception (using PIL as recommended)
-            real_imgs_299 = interpolate(eval_x)
-            fake_imgs_299 = interpolate(fake_imgs)
-            
-            # Update FID metric (expects (fake, real) tuple)
-            fid_metric.update((fake_imgs_299.cuda(), real_imgs_299.cuda()))
-            
-            # Update IS metric (expects only fake images)
-            is_metric.update(fake_imgs_299.cuda())
-    
+
+            # Prepare inputs for metrics
+            real_in = to_inception_input(eval_x)
+            fake_in = to_inception_input(fake_imgs)
+
+            fid_metric.update((fake_in, real_in))
+            is_metric.update(fake_in)
+
+            seen += eval_x.size(0)
+            if seen >= max_eval_samples:
+                break
+
     print(f"\n{'='*50}")
-    # Compute FID and IS
     print("\nCalculating FID...")
     fid_score = fid_metric.compute()
-    print(f"FID Score: {fid_score:.4f} (Lower is Better)")
-    
+    print(f"FID Score: {float(fid_score):.4f} (Lower is Better)")
+
     print("Calculating IS...")
-    is_score = is_metric.compute()
-    print(f"IS Score: {is_score:.4f} (Higher is Better)")
+    is_out = is_metric.compute()
+    if isinstance(is_out, (tuple, list)) and len(is_out) == 2:
+        is_score_mean, is_score_std = is_out
+        print(f"IS Score: {float(is_score_mean):.4f} ± {float(is_score_std):.4f} (Higher is Better)")
+        is_score = is_score_mean
+    else:
+        is_score = is_out
+        print(f"IS Score: {float(is_score):.4f} (Higher is Better)")
     print(f"{'='*50}\n")
-    
+
     # Save visualization images
     if sample_real_list:
-        # Reconstruction samples
         real_samples = torch.cat(sample_real_list, dim=0)
         recon_samples = torch.cat(sample_recon_list, dim=0)
-        resultsample = torch.cat([real_samples, recon_samples]) * 0.5 + 0.5
-        save_image(resultsample.view(-1, 3, im_size, im_size),
-                'results_rec/eval_sample.png', nrow=8)
+        save_image(torch.cat([real_samples, recon_samples], dim=0), 'results_rec/eval_sample.png', nrow=8)
         print("Reconstruction samples saved: results_rec/eval_sample.png")
-        
-        # Generation samples
+
         gen_samples = torch.cat(sample_gen_list, dim=0)
-        resultsample = (gen_samples * 0.5 + 0.5)
-        save_image(resultsample.view(-1, 3, im_size, im_size),
-                'results_gen/eval_sample.png', nrow=8)
+        save_image(gen_samples, 'results_gen/eval_sample.png', nrow=8)
         print("Generation samples saved: results_gen/eval_sample.png")
-    
-    # Save evaluation results
-    result_file = os.path.join(ckpt_dir, 'eval_results.txt')
-    with open(result_file, 'w') as f:
-        f.write(f"Evaluation Results for {ckpt_name}\n")
-        f.write(f"{'='*50}\n")
-        f.write(f"Epoch: {checkpoint.get('epoch', 'unknown')}\n")
-        # Handle different checkpoint formats
-        loss_value = checkpoint.get('min_loss') or checkpoint.get('avg_total_loss')
-        if loss_value is not None:
-            f.write(f"Loss: {loss_value:.6f}\n")
-        else:
-            f.write(f"Loss: unknown\n")
-        f.write(f"FID Score: {fid_score:.4f} (Lower is Better)\n")
-        f.write(f"IS Score: {is_score:.4f} (Higher is Better)\n")
-        f.write(f"Number of batches evaluated: {num_eval_batches}\n")
-    print(f"Evaluation results saved: {result_file}")
-    
+
     return fid_score, is_score
 
+
 def main(args):
-    # Parse arguments
-    is_eval = args['eval']
-    ckpt_dir = args['ckpt_dir']
-    batch_size = args['batch_size']
-    z_size = args['z_size']
     lr = args['lr']
+    is_eval = args['eval']
+    z_size = args['z_size']
+    batch_size = args['batch_size']
     num_epochs = args['num_epochs']
+    ckpt_dir = args['ckpt_dir']
     data_dir = args['data_dir']
+
+    print("Loading data...")
+    train_loader, test_loader = get_dataloader(data_dir, batch_size=batch_size, im_size=im_size)
+    print(f"Train set size: {len(train_loader.dataset)}, Test set size: {len(test_loader.dataset)}\n")
     
     config = {
         'ckpt_dir': ckpt_dir,
@@ -318,38 +306,37 @@ def main(args):
         'lr': lr,
         'num_epochs': num_epochs,
         'data_dir': data_dir,
-        'layer_count': args.get('layer_count', 5),
         'kl_weight': args.get('kl_weight', 0.1),
+        'rec_weight': args.get('rec_weight', 10),
         'ckpt_name': args.get('ckpt_name', 'best.pth'),
+        'save_per_epoch': args.get('save_per_epoch', 10),
     }
     
     if is_eval:
-        # Evaluation mode - always use best.pth
-        fid_score, is_score = eval_vae(config)
+        fid_score, is_score = eval_vae(config, test_loader)
         print(f"Evaluation completed: FID={fid_score:.4f}, IS={is_score:.4f}")
         return
     
-    # Training mode
-    if not os.path.isdir(ckpt_dir):
-        os.makedirs(ckpt_dir)
+    best_epoch, min_loss, best_state_dict = train_vae(config, train_loader)
     
-    best_epoch, min_loss, best_state_dict = train_vae(config)
-    
-    # Save best checkpoint (already saved in train_vae, but ensure it's there)
+    # Print best checkpoint
     if best_state_dict is not None:
         print(f'Training finished: Best ckpt with loss {min_loss:.6f} @ epoch {best_epoch}')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--eval', action='store_true', help='Evaluation mode')
-    parser.add_argument('--ckpt_dir', action='store', type=str, default='./checkpoints', help='eval')
-    parser.add_argument('--ckpt_name', action='store', type=str, default='best.pth', help='ckpt_dir')
-    parser.add_argument('--batch_size', action='store', type=int, default=8, help='batch_size')
-    parser.add_argument('--z_size', action='store', type=int, default=512, help='z_size')
-    parser.add_argument('--lr', action='store', type=float, default=0.0001, help='lr')
+    parser.add_argument('--lr', action='store', type=float, default=0.00005, help='lr')
+    parser.add_argument('--z_size', action='store', type=int, default=64, help='z_size')
+    parser.add_argument('--batch_size', action='store', type=int, default=16, help='batch_size')
+
     parser.add_argument('--num_epochs', action='store', type=int, default=50, help='num_epochs')
-    parser.add_argument('--layer_count', action='store', type=int, default=5, help='layer_count')
-    parser.add_argument('--kl_weight', action='store', type=float, default=0.1, help='kl_weight')
-    parser.add_argument('--data_dir', action='store', type=str, default='/home/ycb410/ycb_ws/vae/datasets/chest_xray/train/', help='data_dir')
+    parser.add_argument('--kl_weight', action='store', type=float, default=0.5, help='kl_weight')
+    parser.add_argument('--rec_weight', action='store', type=float, default=10, help='rec_weight')
+    parser.add_argument('--save_per_epoch', action='store', type=int, default=10, help='save_per_epoch')
+
+    parser.add_argument('--eval', action='store_true', help='eval')
+    parser.add_argument('--ckpt_name', action='store', type=str, default='best.pth', help='ckpt_name')
+    parser.add_argument('--ckpt_dir', action='store', type=str, default='./checkpoints', help='ckpt_dir')
+    parser.add_argument('--data_dir', action='store', type=str, default='/home/ycb410/ycb_ws/vae/datasets/', help='data_dir')
     
     main(vars(parser.parse_args()))

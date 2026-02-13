@@ -1,13 +1,9 @@
 import kagglehub
 import os
 
-# 指定数据集保存路径
+
 output_dir = "/home/ycb410/ycb_ws/vae/datasets"
-
-# 如果目录不存在，创建它
 os.makedirs(output_dir, exist_ok=True)
-
-# 下载数据集到指定目录
 path = kagglehub.dataset_download(
     "paultimothymooney/chest-xray-pneumonia",
     output_dir=output_dir
