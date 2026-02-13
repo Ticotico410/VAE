@@ -7,17 +7,16 @@ import shutil
 import argparse
 
 import torch
-import torch.nn.functional as F
 from torch import optim
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
 from torchvision.utils import save_image
 
 from vae import *
 from tqdm import tqdm
 from ignite.metrics import FID, InceptionScore
 
+from dataLoader import get_dataloader
 from utils import loss_function, viz_loss
-from dataloader import get_dataloader, VAEDataset
 
 
 im_size = 64
